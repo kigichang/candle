@@ -196,6 +196,8 @@ fn training_loop<M: Model>(
     for epoch in 1..args.epochs {
         let logits = model.forward(&train_images)?;
         let log_sm = ops::log_softmax(&logits, D::Minus1)?;
+        println!("log_sm: {:?}", log_sm.shape());
+        println!("train_labels: {:?}", train_labels.shape());
         let loss = loss::nll(&log_sm, &train_labels)?;
         sgd.backward_step(&loss)?;
 
@@ -235,7 +237,7 @@ struct Args {
     #[arg(long)]
     learning_rate: Option<f64>,
 
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 3)]
     epochs: usize,
 
     /// The file where to save the trained weights, in safetensors format.
