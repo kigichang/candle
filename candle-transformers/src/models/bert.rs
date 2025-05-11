@@ -72,6 +72,7 @@ pub struct Config {
     #[serde(default)]
     pub use_cache: bool,
     pub classifier_dropout: Option<f64>,
+    id2label: Option<std::collections::HashMap<String, String>>,
     pub model_type: Option<String>,
 }
 
@@ -93,6 +94,7 @@ impl Default for Config {
             position_embedding_type: PositionEmbeddingType::Absolute,
             use_cache: true,
             classifier_dropout: None,
+            id2label: None,
             model_type: Some("bert".to_string()),
         }
     }
@@ -117,6 +119,7 @@ impl Config {
             position_embedding_type: PositionEmbeddingType::Absolute,
             use_cache: true,
             classifier_dropout: None,
+            id2label: None,
             model_type: Some("bert".to_string()),
         }
     }
@@ -487,10 +490,13 @@ impl BertModel {
                 }
             }
         };
+
+        let pooler = config.id2label.as_ref().and_then(|_| pooler.ok());
+
         Ok(Self {
             embeddings,
             encoder,
-            pooler: pooler.ok(),
+            pooler,
             device: vb.device().clone(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
         })
@@ -512,12 +518,12 @@ impl BertModel {
         // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L995
         let attention_mask = get_extended_attention_mask(&attention_mask, dtype)?;
         let sequence_output = self.encoder.forward(&embedding_output, &attention_mask)?;
-        let result = if let Some(ref pooler) = self.pooler {
-            pooler.forward(&sequence_output)?
+
+        if let Some(ref pooler) = self.pooler {
+            pooler.forward(&sequence_output)
         } else {
-            sequence_output
-        };
-        Ok(result)
+            Ok(sequence_output)
+        }
     }
 }
 
