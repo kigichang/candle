@@ -458,24 +458,27 @@ impl BertEncoder {
 pub struct BertModel {
     embeddings: BertEmbeddings,
     encoder: BertEncoder,
+    pooler: Option<BertPooler>, // 加入 pooler 層
     pub device: Device,
     span: tracing::Span,
 }
 
 impl BertModel {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let (embeddings, encoder) = match (
+        let (embeddings, encoder, pooler) = match (
             BertEmbeddings::load(vb.pp("embeddings"), config),
             BertEncoder::load(vb.pp("encoder"), config),
+            BertPooler::load(vb.pp("pooler"), config),
         ) {
-            (Ok(embeddings), Ok(encoder)) => (embeddings, encoder),
-            (Err(err), _) | (_, Err(err)) => {
+            (Ok(embeddings), Ok(encoder), pooler) => (embeddings, encoder, pooler),
+            (Err(err), _, _) | (_, Err(err), _) => {
                 if let Some(model_type) = &config.model_type {
-                    if let (Ok(embeddings), Ok(encoder)) = (
+                    if let (Ok(embeddings), Ok(encoder), pooler) = (
                         BertEmbeddings::load(vb.pp(format!("{model_type}.embeddings")), config),
                         BertEncoder::load(vb.pp(format!("{model_type}.encoder")), config),
+                        BertPooler::load(vb.pp(format!("{model_type}.pooler")), config),
                     ) {
-                        (embeddings, encoder)
+                        (embeddings, encoder, pooler)
                     } else {
                         return Err(err);
                     }
@@ -487,6 +490,7 @@ impl BertModel {
         Ok(Self {
             embeddings,
             encoder,
+            pooler: pooler.ok(),
             device: vb.device().clone(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
         })
@@ -508,7 +512,12 @@ impl BertModel {
         // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L995
         let attention_mask = get_extended_attention_mask(&attention_mask, dtype)?;
         let sequence_output = self.encoder.forward(&embedding_output, &attention_mask)?;
-        Ok(sequence_output)
+        let result = if let Some(ref pooler) = self.pooler {
+            pooler.forward(&sequence_output)?
+        } else {
+            sequence_output
+        };
+        Ok(result)
     }
 }
 
@@ -621,5 +630,75 @@ impl BertForMaskedLM {
             .bert
             .forward(input_ids, token_type_ids, attention_mask)?;
         self.cls.forward(&sequence_output)
+    }
+}
+
+pub struct BertPooler {
+    dense: Linear,
+    span: tracing::Span,
+}
+
+impl BertPooler {
+    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        let dense = linear(config.hidden_size, config.hidden_size, vb.pp("dense"))?;
+
+        Ok(Self {
+            dense,
+            span: tracing::span!(tracing::Level::TRACE, "pooler"),
+        })
+    }
+
+    pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        // We "pool" the model by simply taking the hidden state corresponding to the first token.
+        use candle::IndexOp;
+        let first_token_tensor = hidden_states.i((.., 0))?.contiguous()?;
+        let pooled_output = self.dense.forward(&first_token_tensor)?;
+        pooled_output.tanh()
+    }
+}
+
+pub struct BertForSequenceClassification {
+    bert: BertModel,
+    dropout: Dropout,
+    classifier: candle_nn::Linear,
+    span: tracing::Span,
+}
+
+impl BertForSequenceClassification {
+    // https://github.com/huggingface/transformers/blob/v4.46.3/src/transformers/models/bert/modeling_bert.py#L1624
+    pub fn load(vb: VarBuilder, config: &Config) -> candle::Result<Self> {
+        let bert = BertModel::load(vb.pp("bert"), config)?;
+        let dropout = Dropout::new(if let Some(pr) = config.classifier_dropout {
+            pr
+        } else {
+            config.hidden_dropout_prob
+        });
+        // num_labels 目前沒有支援多個 Label，故固定為 1
+        let classifier = candle_nn::linear(config.hidden_size, 1, vb.pp("classifier"))?;
+        Ok(Self {
+            bert,
+            dropout,
+            classifier,
+            span: tracing::span!(tracing::Level::TRACE, "SequenceClassification"),
+        })
+    }
+
+    // https://github.com/huggingface/transformers/blob/v4.46.3/src/transformers/models/bert/modeling_bert.py#L1647
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        token_type_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> candle::Result<Tensor> {
+        let _enter = self.span.enter();
+        let output = self
+            .bert
+            .forward(input_ids, token_type_ids, attention_mask)?;
+
+        // https://github.com/huggingface/transformers/blob/v4.46.3/src/transformers/models/bert/modeling_bert.py#L1682
+        let pooled_output = self.dropout.forward(&output)?;
+        let logits = self.classifier.forward(&pooled_output)?;
+        Ok(logits)
     }
 }
